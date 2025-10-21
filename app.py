@@ -3,9 +3,11 @@ import numpy as np
 import cv2
 import tensorflow as tf
 import os
+from typing import Tuple, Dict
 
 # ---------------- CONFIG ----------------
-MODEL_PATH = os.path.join("model", "nails_seg_s_yolov8_v1_float16.tflite")
+MODEL_FILENAME = "nails_seg_s_yolov8_v1_float16.tflite"  # <- model at repo root
+MODEL_PATH = os.path.join(".", MODEL_FILENAME)
 
 NAIL_COLOR = (30, 30, 200)
 ALPHA = 0.5
@@ -15,14 +17,20 @@ DILATION_PIXELS = 5
 FEATHER = 5
 CONF_THRESHOLD = 0.25
 
-# ---------------- LOAD MODEL ----------------
-st.write("🔄 Loading TFLite model...")
-interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-interpreter.allocate_tensors()
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
-st.success("✅ Model loaded successfully!")
-
+# ---------------- MODEL LOADER (cached) ----------------
+@st.cache_resource
+def load_tflite_interpreter(model_path: str) -> Dict:
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found at: {model_path}")
+    interpreter = tf.lite.Interpreter(model_path=model_path)
+    interpreter.allocate_tensors()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    return {
+        "interpreter": interpreter,
+        "input_details": input_details,
+        "output_details": output_details,
+    }
 
 # ---------------- HELPERS ----------------
 def chaikin_smooth(pts, iterations=3):
@@ -51,15 +59,24 @@ def smooth_mask(mask):
     return refined
 
 
-def process_nails(image):
+def process_nails(image: np.ndarray, interp_details: Dict) -> np.ndarray:
+    """
+    image: RGB image (H,W,3) as numpy array
+    interp_details: dict with interpreter,input_details,output_details
+    returns: RGB image (H,W,3)
+    """
     if image is None:
         return None
 
-    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    H, W = image.shape[:2]
+    interpreter = interp_details["interpreter"]
+    input_details = interp_details["input_details"]
+    output_details = interp_details["output_details"]
+
+    image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    H, W = image_bgr.shape[:2]
 
     # Preprocess
-    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     img_resized = cv2.resize(img_rgb, (640, 640))
     img_normalized = img_resized.astype(np.float32) / 255.0
     input_tensor = np.expand_dims(img_normalized, axis=0)
@@ -83,10 +100,10 @@ def process_nails(image):
     mask_coeffs = mask_coeffs[valid_indices]
 
     if len(boxes) == 0:
-        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
     mask_protos = mask_protos[0]
-    overlay = image.copy()
+    overlay = image_bgr.copy()
 
     for i in range(len(boxes)):
         mask_coef = mask_coeffs[i]
@@ -120,7 +137,7 @@ def process_nails(image):
         feather = max(1, FEATHER if FEATHER % 2 == 1 else FEATHER + 1)
         alpha_mask = cv2.GaussianBlur(refined, (feather, feather), 0).astype(np.float32) / 255.0
 
-        color_layer = np.zeros_like(image, dtype=np.uint8)
+        color_layer = np.zeros_like(image_bgr, dtype=np.uint8)
         color_layer[:, :] = NAIL_COLOR
         alpha_3 = alpha_mask[:, :, None]
         overlay = (overlay * (1 - alpha_3) + color_layer * alpha_3 * ALPHA).astype(np.uint8)
@@ -130,27 +147,49 @@ def process_nails(image):
 
 # ---------------- STREAMLIT UI ----------------
 st.set_page_config(page_title="💅 Nail Segmentation Tester", layout="wide")
-
 st.title("💅 Nail Segmentation Tester")
 st.markdown("📸 Take a snapshot or upload an image — works smoothly without lag!")
 
-col1, col2 = st.columns(2)
+# Try to load the model (cached). Show a friendly message if missing.
+interp_details = None
+try:
+    with st.spinner("Loading TFLite model..."):
+        interp_details = load_tflite_interpreter(MODEL_PATH)
+    st.success("Model loaded successfully.")
+except FileNotFoundError:
+    st.error(f"Model not found at `{MODEL_PATH}`. Please upload `{MODEL_FILENAME}` to the repository root.")
+    st.stop()
+except Exception as e:
+    st.error(f"Error loading model: {e}")
+    st.stop()
+
+col1, col2 = st.columns([1, 1])
 
 with col1:
-    uploaded_img = st.camera_input("📸 Take a Snapshot") or st.file_uploader("📤 Or Upload an Image", type=["jpg", "jpeg", "png"])
+    cam = st.camera_input("📸 Take a Snapshot")
+    uploaded = st.file_uploader("📤 Or upload an image", type=["jpg", "jpeg", "png"])
 
-if uploaded_img is not None:
-    file_bytes = np.asarray(bytearray(uploaded_img.read()), dtype=np.uint8)
-    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    st.session_state['input_image'] = img_rgb
+# pick camera if available else uploaded file
+input_file = cam if cam is not None else uploaded
+if input_file is not None:
+    # read image bytes and decode
+    file_bytes = np.asarray(bytearray(input_file.read()), dtype=np.uint8)
+    img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        st.error("Cannot decode the image. Try a different file.")
+    else:
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        st.session_state['input_image'] = img_rgb
 else:
     img_rgb = st.session_state.get('input_image', None)
 
 if img_rgb is not None:
     with st.spinner("🎨 Processing nails..."):
-        output = process_nails(img_rgb)
-    col2.image(output, caption="✨ Processed Result", use_container_width=True)
+        try:
+            output = process_nails(img_rgb, interp_details)
+            col2.image(output, caption="✨ Processed Result", use_column_width=True)
+        except Exception as e:
+            st.error(f"Processing error: {e}")
 else:
     col2.info("Please capture or upload an image to start.")
 
